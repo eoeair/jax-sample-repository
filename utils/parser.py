@@ -17,6 +17,7 @@ def get_parser():
 
     # feeder
     parser.add_argument('--feeder', default='feeder.feeder', help='data loader will be used')
+    parser.add_argument('--num-worker',type=int,default=8,help='the number of worker for data loader')
     parser.add_argument('--train-feeder-args',default=dict(),help='the arguments of data loader for training')
     parser.add_argument('--test-feeder-args',default=dict(),help='the arguments of data loader for test')
 
@@ -32,7 +33,6 @@ def get_parser():
     parser.add_argument('--nesterov', type=str2bool, default=False, help='use nesterov or not')
     parser.add_argument('--batch-size', type=int, default=256, help='training batch size')
     parser.add_argument('--test-batch-size', type=int, default=256, help='test batch size')
-    parser.add_argument('--buffer-size', type=int, default=100, help='buffer size for shuffling')
     parser.add_argument('--start-epoch',type=int,default=0,help='start training from which epoch')
     parser.add_argument('--num-epoch',type=int,default=80,help='stop training in which epoch')
     parser.add_argument('--L2_REG', type=float, default=0.0001, help='L2 regularization')

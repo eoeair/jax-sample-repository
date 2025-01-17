@@ -1,19 +1,24 @@
 import os
 
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_triton_gemm_any=True " "--xla_gpu_enable_latency_hiding_scheduler=true "
-)
+import multiprocessing
+
+multiprocessing.set_start_method("spawn", force=True)
+# os.environ["XLA_FLAGS"] = (
+#     "--xla_gpu_triton_gemm_any=True " "--xla_gpu_enable_latency_hiding_scheduler=true "
+# )
 
 import yaml
 
 import numpy as np
 
-# jax, flax, optax, tensorflow
+# torch, jax, flax, optax, orbax
+import torch  # just for data loader
 import jax
+import jax.numpy as jnp
 import flax.serialization
 import flax.nnx as nn
 import optax
-import tensorflow as tf
+import orbax.checkpoint as orbax
 
 # record
 from tqdm import tqdm
@@ -51,7 +56,7 @@ if __name__ == "__main__":
     arg = parser.parse_args()
 
     # set device
-    # device = jax.devices()[arg.device]
+    device = jax.devices(arg.device)[0]
 
     # set up tensorboard
     writer = SummaryWriter(arg.work_dir)
@@ -62,20 +67,21 @@ if __name__ == "__main__":
 
     # set up data loader
     Feeder = import_class(arg.feeder)
-
     if arg.phase == "train":
-        # 调用 get_dataset() 获取 tf.data.Dataset
-        train_dataset = Feeder(**arg.train_feeder_args).get_dataset()
-        train_dataset = (
-            train_dataset.shuffle(buffer_size=arg.buffer_size)
-            .batch(arg.batch_size)
-            .prefetch(tf.data.AUTOTUNE)
+        trainloader = torch.utils.data.DataLoader(
+            dataset=Feeder(**arg.train_feeder_args),
+            batch_size=arg.batch_size,
+            shuffle=True,
+            num_workers=arg.num_worker,
+            pin_memory=True,
         )
-        trainloader = train_dataset
-
-    test_dataset = Feeder(**arg.test_feeder_args).get_dataset()
-    test_dataset = test_dataset.batch(arg.test_batch_size).prefetch(tf.data.AUTOTUNE)
-    testloader = test_dataset
+    testloader = torch.utils.data.DataLoader(
+        dataset=Feeder(**arg.test_feeder_args),
+        batch_size=arg.test_batch_size,
+        shuffle=False,
+        num_workers=arg.num_worker,
+        pin_memory=True,
+    )
 
     # set up model
     Model = import_class(arg.model)
@@ -100,16 +106,13 @@ if __name__ == "__main__":
     state = nn.state((model, optimizer))
 
     # automatically resume from checkpoint if it exists
-    path = os.path.join(arg.work_dir, "checkpoint.jax")
+    path = os.path.join(arg.work_dir, "ckpt")
+    path = os.path.abspath(path)  # 获取绝对路径
+    checkpointer = orbax.PyTreeCheckpointer()
     if os.path.exists(path):
-        with open(path, "rb") as f:
-            byte_data = f.read()
-        flax.serialization.from_bytes(
-            {"state": state, "start_epoch": arg.start_epoch},
-            byte_data,
-        )
-    else:
-        arg.start_epoch = 0
+        ckpt = checkpointer.restore(f"{path}")
+        state = ckpt["state"]
+        arg.start_epoch = ckpt["start_epoch"]
 
     nn.update((model, optimizer), state)
 
@@ -117,8 +120,7 @@ if __name__ == "__main__":
     miou = IoU(arg.model_args["num_class"])
 
     @nn.jit
-    def train_step(model, optimizer: nn.Optimizer, batch):
-        data, label = batch["data"], batch["label"]
+    def train_step(model, optimizer: nn.Optimizer, data, label):
 
         def loss_fn(model):
             logits = model(data)
@@ -129,14 +131,11 @@ if __name__ == "__main__":
 
         loss, grads = nn.value_and_grad(loss_fn)(model)
         optimizer.update(grads)
-        print(type(loss))
-        print("Train loss: {}".format(loss))
 
         return loss
 
     @nn.jit
-    def test_step(model, batch):
-        data, label = batch["data"], batch["label"]
+    def test_step(model, data, label):
         logits = model(data)
         loss = optax.softmax_cross_entropy_with_integer_labels(
             logits=logits, labels=label
@@ -145,29 +144,30 @@ if __name__ == "__main__":
 
     # Executes a training loop.
     for epoch in range(arg.start_epoch, arg.num_epoch):
+        print("Epoch:[{}/{}]".format(epoch + 1, arg.num_epoch))
         best_test_miou = 0
 
-        for batch_idx, train_batch in enumerate(
-            tqdm(
-                trainloader.as_numpy_iterator(), desc=f"Epoch {epoch+1}/{arg.num_epoch}"
-            )
-        ):
-            loss = train_step(model, optimizer, train_batch)
+        for batch_idx, (data, label) in enumerate(tqdm(trainloader)):
+            data = jnp.array(data, dtype=jnp.bfloat16, device=device)
+            label = jnp.array(label, dtype=jnp.int32, device=device)
+            loss = train_step(model, optimizer, data, label)
             writer.add_scalar("loss", loss, epoch * iter_per_epoch_train + batch_idx)
-            print("loss: {}".format(loss))
-            state = nn.state((model, optimizer))
-            ckpt_data = {"state": state, "start_epoch": epoch + 1}
-            with open(path, "wb") as f:
-                f.write(flax.serialization.to_bytes(ckpt_data))
+            if epoch == arg.num_epoch - 1 and batch_idx == len(trainloader) - 1:
+                state = nn.state((model, optimizer))
+                checkpointer = orbax.PyTreeCheckpointer()
+                ckpt = {"state": state, "start_epoch": epoch + 1}
+                checkpointer.save(f"{path}", ckpt)
+
+        print("loss: {}".format(loss))
 
         if epoch % 10 == 0:
-            for batch_idx, test_batch in enumerate(
-                tqdm(testloader.as_numpy_iterator(), desc="Testing")
-            ):
+            for batch_idx, (data, label) in enumerate(tqdm(testloader)):
+                data = jnp.array(data, dtype=jnp.bfloat16, device=device)
+                label_jax = jnp.array(label, dtype=jnp.int32, device=device)
                 miou.reset()
-                loss, logits = test_step(model, test_batch)
+                loss, logits = test_step(model, data, label_jax)
                 # compute iou and miou
-                label = test_batch["label"]
+                logits = jnp.array(logits, device=jax.devices("cpu")[0])
                 miou.add(logits, label)
                 iou, m_iou = miou.value()
                 print("Test iou: {} Test miou: {} loss: {}".format(iou, miou, loss))
